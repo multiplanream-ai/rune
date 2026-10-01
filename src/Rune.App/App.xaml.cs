@@ -1,11 +1,16 @@
 using Microsoft.UI.Xaml;
+using Microsoft.Windows.AppLifecycle;
 using Rune.Services;
+using Windows.ApplicationModel.Activation;
+using Windows.Storage;
 
 namespace Rune;
 
 public partial class App : Application
 {
     public static Window? MainWindow { get; private set; }
+
+    private bool _handlingRedirectedActivations;
 
     public App()
     {
@@ -14,7 +19,7 @@ public partial class App : Application
         // Safety net. An `async void` handler (every WinUI event handler is one)
         // has no Task to park an exception in, so the runtime rethrows it on the
         // dispatcher and the process dies unless Handled is set here. Log it and
-        // keep running — a reader losing an hour of annotations to a transient
+        // keep running: a reader losing an hour of annotations to a transient
         // failure is far worse than a stale error message.
         UnhandledException += (_, e) =>
         {
@@ -45,13 +50,26 @@ public partial class App : Application
         }
         catch
         {
-            // Window may be closing or not built yet — the log already has it.
+            // Window may be closing or not built yet. The log already has it.
         }
     }
 
     protected override async void OnLaunched(LaunchActivatedEventArgs args)
     {
-        var window = new MainWindow();
+        List<string> activatedPaths = GetActivatedPdfPaths(Program.InitialActivation);
+        var commandLine = GetCommandLineRequest();
+
+        // The unpackaged/portable build receives its file through argv instead
+        // of rich file activation. Keep that existing behavior for first launch.
+        if (activatedPaths.Count == 0 && commandLine.Path is not null)
+        {
+            activatedPaths.Add(commandLine.Path);
+        }
+
+        // Opening a specific PDF is an explicit request. Start a fresh workspace
+        // instead of resurrecting the previous session first. A normal Rune
+        // launch continues to honor the user's RestoreSession setting.
+        var window = new MainWindow(restoreSessionOnStartup: activatedPaths.Count == 0);
         MainWindow = window;
 
         // Window/taskbar icon (the exe icon comes from ApplicationIcon in the csproj).
@@ -63,26 +81,115 @@ public partial class App : Application
 
         window.Activate();
 
-        // Support "Rune.exe <file.pdf> [--page N] [--zoom Z]" — the file path
-        // is how Explorer launches the default handler once file association
-        // lands (M6); --page/--zoom are for scripted testing.
-        string[] commandLine = Environment.GetCommandLineArgs();
-        if (commandLine.Length > 1 && File.Exists(commandLine[1]))
+        foreach (string path in activatedPaths)
         {
-            int? page = null;
-            double? zoom = null;
-            for (int i = 2; i < commandLine.Length - 1; i++)
+            bool isCommandLineTarget = commandLine.Path is not null &&
+                string.Equals(path, commandLine.Path, StringComparison.OrdinalIgnoreCase);
+
+            await window.LoadDocumentAsync(
+                path,
+                isCommandLineTarget ? commandLine.Page : null,
+                isCommandLineTarget ? commandLine.Zoom : null);
+        }
+
+        // A second launch can be redirected while the first window is still
+        // being constructed. Drain anything that arrived during startup.
+        HandleRedirectedActivations();
+    }
+
+    /// <summary>
+    /// Opens files redirected from later Explorer launches in the existing Rune
+    /// window. Program marshals this call onto the UI thread.
+    /// </summary>
+    internal async void HandleRedirectedActivations()
+    {
+        if (_handlingRedirectedActivations)
+        {
+            return;
+        }
+
+        _handlingRedirectedActivations = true;
+        try
+        {
+            while (Program.RedirectedActivations.TryDequeue(out AppActivationArguments? activation))
             {
-                if (commandLine[i] == "--page" && int.TryParse(commandLine[i + 1], out int p))
+                if (MainWindow is not MainWindow window)
                 {
-                    page = p;
+                    continue;
                 }
-                if (commandLine[i] == "--zoom" && double.TryParse(commandLine[i + 1], out double z))
+
+                // Bring the existing window forward for any redirected launch,
+                // even if the activation did not carry a document.
+                window.AppWindow.Show(true);
+
+                foreach (string path in GetActivatedPdfPaths(activation))
                 {
-                    zoom = z;
+                    await window.LoadDocumentAsync(path);
                 }
             }
-            await window.LoadDocumentAsync(commandLine[1], page, zoom);
         }
+        catch (Exception ex)
+        {
+            ErrorLog.Default.Write("RedirectedActivation", ex);
+            ReportToUser(ex.Message);
+        }
+        finally
+        {
+            _handlingRedirectedActivations = false;
+
+            // Close the small race where another activation arrives after the
+            // queue looked empty but before the flag was cleared.
+            if (!Program.RedirectedActivations.IsEmpty)
+            {
+                HandleRedirectedActivations();
+            }
+        }
+    }
+
+    private static List<string> GetActivatedPdfPaths(AppActivationArguments? activation)
+    {
+        var paths = new List<string>();
+
+        if (activation?.Kind != ExtendedActivationKind.File ||
+            activation.Data is not IFileActivatedEventArgs fileArgs)
+        {
+            return paths;
+        }
+
+        foreach (var item in fileArgs.Files)
+        {
+            if (item is StorageFile file &&
+                string.Equals(file.FileType, ".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                paths.Add(file.Path);
+            }
+        }
+
+        return paths;
+    }
+
+    private static (string? Path, int? Page, double? Zoom) GetCommandLineRequest()
+    {
+        string[] commandLine = Environment.GetCommandLineArgs();
+        if (commandLine.Length <= 1 || !File.Exists(commandLine[1]))
+        {
+            return (null, null, null);
+        }
+
+        int? page = null;
+        double? zoom = null;
+        for (int i = 2; i < commandLine.Length - 1; i++)
+        {
+            if (commandLine[i] == "--page" && int.TryParse(commandLine[i + 1], out int p))
+            {
+                page = p;
+            }
+            if (commandLine[i] == "--zoom" && double.TryParse(commandLine[i + 1], out double z))
+            {
+                zoom = z;
+            }
+        }
+
+        return (commandLine[1], page, zoom);
     }
 }

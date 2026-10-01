@@ -21,6 +21,9 @@
     <AppxSymbolPackageEnabled>false</AppxSymbolPackageEnabled>
     <UseWinUI>true</UseWinUI>
     <EnableMsixTooling>true</EnableMsixTooling>
+    <!-- AppInstance single-instance routing must run before XAML initializes,
+         so Rune provides its own Program.Main. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
     <!-- Default: unpackaged self-contained exe (dev + portable zip).
          Release MSIX overrides on the command line: -p:WindowsPackageType=MSIX -->
     <WindowsPackageType Condition="'$(WindowsPackageType)' == ''">None</WindowsPackageType>
@@ -34,7 +37,7 @@
          .NET" download dialog, which never reproduces on a dev machine because
          a dev machine has the runtime.
 
-         So it lives HERE, unconditionally, rather than on either command line —
+         So it lives HERE, unconditionally, rather than on either command line -
          neither path can carry it alone, and Debug builds what Release ships.
          `tools/check-package.ps1` asserts the runtime actually made it into the
          package, because this failure is otherwise completely silent. -->
